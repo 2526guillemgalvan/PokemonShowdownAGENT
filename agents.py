@@ -23,10 +23,41 @@ from openai import AsyncOpenAI
 from poke_env.data import GenData
 from poke_env.player import Player
 
+# --- PokeAPI client (ability descriptions, etc.) ---
+import pokeapi
+
 # Type chart used for damage-multiplier calculations injected into the prompt.
 # Gen 9 covers the most common Showdown ladder formats; falls back gracefully
 # when a battle uses a different generation.
 _TYPE_CHART = GenData.from_gen(9).type_chart
+
+
+def _build_type_chart_text() -> str:
+    """Compact offensive type chart for the system prompt — only non-1x cells."""
+    types = sorted(_TYPE_CHART.keys())
+    lines = ["TYPE CHART (attacker → multiplier vs defender). Anything not listed is 1x:"]
+    for atk in types:
+        sup, res, imm = [], [], []
+        for d in types:
+            m = _TYPE_CHART.get(d, {}).get(atk, 1)
+            if m == 2:
+                sup.append(d.title())
+            elif m == 0.5:
+                res.append(d.title())
+            elif m == 0:
+                imm.append(d.title())
+        parts = []
+        if sup:
+            parts.append("2x→" + ",".join(sup))
+        if res:
+            parts.append("0.5x→" + ",".join(res))
+        if imm:
+            parts.append("0x→" + ",".join(imm))
+        lines.append(f"  {atk.title():9s}: {' | '.join(parts) if parts else 'all 1x'}")
+    return "\n".join(lines)
+
+
+_TYPE_CHART_TEXT = _build_type_chart_text()
 
 
 def normalize_name(name: str) -> str:
@@ -362,6 +393,20 @@ class LLMAgentBase(Player):
         except Exception:
             return "unknown"
 
+    @staticmethod
+    def _ability_note(pkmn) -> str:
+        """Returns a short ability descriptor: '(Ability: X — description)' or
+        '(Ability unknown; possible: ... )' if not yet revealed."""
+        if pkmn.ability:
+            desc = pokeapi.get_cached_ability(pkmn.ability)
+            if desc:
+                return f"Ability: {pkmn.ability} — {desc}"
+            return f"Ability: {pkmn.ability}"
+        candidates = list(getattr(pkmn, "possible_abilities", []) or [])
+        if candidates:
+            return f"Ability unknown; possible: {', '.join(candidates)}"
+        return "Ability: unknown"
+
     def _format_battle_state(self, battle) -> str:
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
@@ -371,7 +416,8 @@ class LLMAgentBase(Player):
             f"(Type: {'/'.join(map(str, active.types))}) "
             f"HP: {active.current_hp_fraction * 100:.1f}% "
             f"Status: {active.status.name if active.status else 'None'} "
-            f"Boosts: {active.boosts}"
+            f"Boosts: {active.boosts}\n"
+            f"  {self._ability_note(active)}"
         )
 
         if opponent:
@@ -380,12 +426,18 @@ class LLMAgentBase(Player):
                 f"(Type: {'/'.join(map(str, opponent.types))}) "
                 f"HP: {opponent.current_hp_fraction * 100:.1f}% "
                 f"Status: {opponent.status.name if opponent.status else 'None'} "
-                f"Boosts: {opponent.boosts}"
+                f"Boosts: {opponent.boosts}\n"
+                f"  {self._ability_note(opponent)}"
             )
             speed_note = self._speed_comparison(active, opponent)
+            # How much each of opponent's STAB types would do to OUR active
+            # (helps the model reason about incoming threats without recalling
+            # the full type chart from memory).
+            your_defenses = self._defensive_profile(active, opponent.types)
             opponent_info = (
                 f"Opponent's active Pokemon: {opp_info_str}\n"
-                f"You outspeed opponent: {speed_note}"
+                f"You outspeed opponent: {speed_note}\n"
+                f"Your active takes from opp's STAB types: {your_defenses}"
             )
         else:
             opponent_info = "Opponent's active Pokemon: Unknown"
@@ -398,21 +450,24 @@ class LLMAgentBase(Player):
                 desc = self._describe_move(move)
                 desc_note = f" | Effect: {desc}" if desc else ""
                 if move.base_power <= 0:
-                    # Status moves: make it loud that they don't deal damage so the
-                    # model doesn't reason about type effectiveness on them.
+                    # Status moves: lead with the loud STATUS marker so the model
+                    # doesn't reason about offensive type effectiveness on them.
                     lines.append(
-                        f"- {move.id} | Type: {move.type} | STATUS (no damage, side effect only) "
-                        f"| Acc: {move.accuracy} | PP: {move.current_pp}/{move.max_pp}{desc_note}"
+                        f"- {move.id} | STATUS (no damage, side effect only) "
+                        f"| MoveType: {move.type} | Acc: {move.accuracy} "
+                        f"| PP: {move.current_pp}/{move.max_pp}{desc_note}"
                     )
                 else:
                     eff = self._move_effectiveness(move, opponent)
                     dmg = self._estimate_damage_pct(move, active, opponent)
-                    eff_note = f" | Eff: {eff:g}x" if eff is not None else ""
-                    dmg_note = f" | Est dmg: ~{dmg:.0f}% of opp HP" if dmg is not None else ""
+                    is_stab = move.type in (active.types or [])
+                    dmg_lead = f"Est dmg: ~{dmg:.0f}% opp HP" if dmg is not None else "Est dmg: n/a"
+                    eff_lead = f"Eff: {eff:g}x" if eff is not None else "Eff: n/a"
+                    stab_tag = " | STAB 1.5x" if is_stab else " | no STAB"
                     lines.append(
-                        f"- {move.id} | Type: {move.type} | {cat} | BP: {move.base_power} "
-                        f"| Acc: {move.accuracy} | PP: {move.current_pp}/{move.max_pp}"
-                        f"{eff_note}{dmg_note}{desc_note}"
+                        f"- {move.id} | {dmg_lead} | {eff_lead}{stab_tag} | MoveType: {move.type} "
+                        f"| {cat} | BP: {move.base_power} | Acc: {move.accuracy} "
+                        f"| PP: {move.current_pp}/{move.max_pp}{desc_note}"
                     )
             moves_info += "\n".join(lines)
         else:
@@ -430,7 +485,8 @@ class LLMAgentBase(Player):
                     f"- {pkmn.species} (HP: {pkmn.current_hp_fraction * 100:.1f}%, "
                     f"Status: {pkmn.status.name if pkmn.status else 'None'}, "
                     f"Type: {'/'.join(map(str, pkmn.types))}, "
-                    f"Defenses {profile})"
+                    f"Defenses {profile})\n"
+                    f"    {self._ability_note(pkmn)}"
                 )
             switches_info += "\n".join(lines)
         else:
@@ -514,7 +570,30 @@ class LLMAgentBase(Player):
             return self.choose_random_move(battle)
         return self.choose_default_move(battle)
 
+    async def _prefetch_pokeapi(self, battle) -> None:
+        """Fetch ability descriptions in parallel for every visible mon.
+        Skips fetching Pokemon-level data — poke-env already gives us types,
+        base stats, and possible_abilities, and the PokeAPI /pokemon endpoint
+        404s on most variant formes (sawsbuck-autumn, etc.)."""
+        abilities: set = set()
+        for p in (battle.team or {}).values():
+            if p.ability:
+                abilities.add(p.ability)
+            for a in (getattr(p, "possible_abilities", None) or []):
+                abilities.add(a)
+        opp = battle.opponent_active_pokemon
+        if opp:
+            if opp.ability:
+                abilities.add(opp.ability)
+            for a in (getattr(opp, "possible_abilities", None) or []):
+                abilities.add(a)
+        # Filter out ones we already cached or already failed.
+        new = [a for a in abilities if pokeapi.get_cached_ability(a) is None]
+        if new:
+            await pokeapi.warm_team_cache([], new)
+
     async def choose_move(self, battle) -> str:
+        await self._prefetch_pokeapi(battle)
         battle_state_str = self._format_battle_state(battle)
         budget = self._timer_budget_for(battle)
         bank = self._timer_bank[battle.battle_tag]
@@ -734,15 +813,36 @@ class LMStudioAgent(LLMAgentBase):
 
     async def _get_llm_decision(self, battle_state: str) -> Dict[str, Any]:
         system_prompt = (
-            "You are a competitive Pokemon battle expert. Goal: win.\n"
-            "For every turn, follow this two-step protocol:\n"
-            "  1. ANALYZE first. Fill the required 'analysis' field with 3-5 sentences covering type matchups, "
-            "speed, HP/status, threats, and why your choice beats the alternatives.\n"
-            "  2. THEN pick the action: set move_name or pokemon_name to a value from the available list "
-            "(exact move ID or species name).\n"
-            "Also fill 'reasoning' with one short sentence (<250 chars) for the in-game chat.\n"
-            "The battle state already has pre-computed type effectiveness ('Eff: 2x' on each move) and a "
-            "speed comparison — use them, don't re-derive them."
+            "You are a competitive Pokemon battle expert. Goal: win.\n\n"
+            "STRICT RULE: Use ONLY the values shown in the battle state below. DO NOT invent or "
+            "recall numbers from memory. The state contains the authoritative move accuracy, base power, "
+            "type effectiveness, estimated damage %, speed range, and effect description for every move "
+            "you can use. If the data shows 'Acc: 1.0' the move has 100% accuracy — do NOT say it has 70%. "
+            "If the data shows 'Eff: 0.5x' the move is RESISTED — do NOT call it super effective. If the "
+            "Effect field shows '+1 spa on user' that is the ONLY effect — do NOT say it boosts speed.\n\n"
+            "CRITICAL — MOVE TYPE vs POKEMON TYPE:\n"
+            "  * Each MOVE has its own type (the 'MoveType' field). That is what determines offensive "
+            "effectiveness (super-effective / resisted / immune) against the opponent's defending types.\n"
+            "  * The user's POKEMON TYPE is independent of its moves. It only matters for: "
+            "(a) STAB (1.5x bonus when MoveType matches one of the user's types), "
+            "(b) defending against incoming attacks.\n"
+            "  * Example: Gyarados is Water/Flying. If it uses Earthquake (MoveType: Ground), the "
+            "effectiveness vs the opponent depends on GROUND vs the opponent's types — NOT on Water/Flying. "
+            "Gyarados gets NO STAB on Earthquake because Ground is not Water or Flying.\n"
+            "  * Always check the precomputed 'Eff: Xx' and 'Est dmg: ~Y%' fields per move — they are "
+            "already correct for THIS move vs THIS opponent.\n\n"
+            f"{_TYPE_CHART_TEXT}\n\n"
+            "TOOL CHOICE — DO NOT MIX THEM UP:\n"
+            "  * If you decide to USE A MOVE → call choose_move with a NON-EMPTY move_name from the "
+            "available moves list.\n"
+            "  * If you decide to SWITCH POKEMON → call choose_switch with pokemon_name from the available "
+            "switches. NEVER call choose_move with an empty move_name to mean 'switch'.\n\n"
+            "Per-turn protocol:\n"
+            "  1. ANALYZE first. Fill 'analysis' with 3-5 sentences citing the EXACT numbers from the data: "
+            "type matchups (cite Eff/Est dmg per move), STAB if shown, speed comparison, HP/status, threats, "
+            "and why your pick beats the alternatives.\n"
+            "  2. THEN pick the action: set move_name or pokemon_name (exact id / species from the available list).\n"
+            "  3. Fill 'reasoning' with one short sentence (<250 chars) for the in-game chat."
         )
         user_prompt = (
             f"Current Battle State:\n{battle_state}\n\n"
@@ -759,7 +859,7 @@ class LMStudioAgent(LLMAgentBase):
                 ],
                 tools=self.tools,
                 tool_choice="auto",
-                temperature=0.3,
+                temperature=0.05,
                 max_tokens=1024,
             )
             message = response.choices[0].message
