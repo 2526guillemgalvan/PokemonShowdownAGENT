@@ -943,7 +943,9 @@ _OPENAI_TOOLS = [
 
 
 class LMStudioAgent(LLMAgentBase):
-    """Uses a local LM Studio server (OpenAI-compatible) for decisions."""
+    """Uses a local LM Studio server (OpenAI-compatible) for decisions.
+    Also works with any OpenAI-compatible endpoint (Ollama, vLLM, etc.) —
+    point base_url at it."""
 
     def __init__(
         self,
