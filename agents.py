@@ -99,6 +99,10 @@ STANDARD_TOOL_SCHEMA = {
                     "type": "string",
                     "description": "The exact name or ID (e.g., 'thunderbolt', 'swordsdance') of the move to use. Must be one of the available moves.",
                 },
+                "terastallize": {
+                    "type": "boolean",
+                    "description": "Set to true to Terastallize this turn alongside the move. ONLY valid if the battle state shows 'Can Terastallize this turn: yes'. Tera changes your defensive type to your tera_type and any move matching that type gets STAB. Use when it gives a damage boost or defensive cushion.",
+                },
                 **_REASONING_PROP,
             },
             "required": ["analysis", "move_name"],
@@ -123,6 +127,74 @@ STANDARD_TOOL_SCHEMA = {
 }
 
 CHAT_MAX_LEN = 280
+
+
+# Hardcoded warnings for moves with mechanics that even good pokeapi descriptions
+# don't capture clearly — or where the model tends to make wrong inferences.
+# Appended to the move line's Effect field.
+_SETUP_WARNING = (
+    "SETUP MOVE — wastes a turn. ONLY use at HP ≥ 60% AND when you can survive opp's "
+    "next hit AND have time to abuse the boost. NEVER use at low HP (you'll faint before "
+    "benefiting). Just attack instead."
+)
+
+_MOVE_WARNINGS: Dict[str, str] = {
+    # Setup moves — all share the same caveat
+    "swordsdance": _SETUP_WARNING,
+    "nastyplot": _SETUP_WARNING,
+    "calmmind": _SETUP_WARNING,
+    "dragondance": _SETUP_WARNING,
+    "bulkup": _SETUP_WARNING,
+    "workup": _SETUP_WARNING,
+    "irondefense": _SETUP_WARNING,
+    "acidarmor": _SETUP_WARNING,
+    "agility": _SETUP_WARNING,
+    "rockpolish": _SETUP_WARNING,
+    "amnesia": _SETUP_WARNING,
+    "cosmicpower": _SETUP_WARNING,
+    "shiftgear": _SETUP_WARNING,
+    "shellsmash": (
+        "SETUP — also LOWERS Def and SpD by 1. Only at high HP when you can sweep "
+        "(usually +2 atk/spa/spe means OHKO next turn)."
+    ),
+    "curse": (
+        "If user is Ghost-type: cuts user's HP by 50% to curse opponent (loses ~25%/turn). "
+        "Otherwise: SETUP MOVE +1 Atk +1 Def -1 Spe — only use at HP ≥ 60%."
+    ),
+    "suckerpunch": "FAILS if target doesn't pick a damaging move this turn (e.g. switches or uses status). Use only when you predict an attack.",
+    "pursuit": "Doubles to 140 BP if target switches out this turn. Great into predictable switches.",
+    "fakeout": "+3 priority, but ONLY works on the first turn this Pokemon is in the field after switching in.",
+    "bellydrum": "Halves user's HP for +6 Atk. ONLY use at near-full HP and when you can clean up next turn.",
+    "explosion": "User FAINTS after use. Sacrifice move — only when KO is otherwise unavoidable.",
+    "selfdestruct": "User FAINTS after use. Sacrifice move.",
+    "memento": "User FAINTS, lowers opp Atk and SpA by 2 stages. Pivot tool.",
+    "healingwish": "User FAINTS, fully heals + cures status on the replacement Pokemon.",
+    "lunardance": "User FAINTS, fully heals + restores PP + cures status on the replacement.",
+    "destinybond": "If user faints from a hit this turn, attacker also faints. Use at low HP when you'd faint anyway.",
+    "counter": "Returns 2x the physical damage taken this turn. Fails vs special moves or if user moves first.",
+    "mirrorcoat": "Returns 2x the special damage taken this turn. Fails vs physical moves or if user moves first.",
+    "focuspunch": "+1 priority but charges first; FAILS if user is hit by any damaging move before attacking.",
+    "rest": "User sleeps for 2 turns, fully heals + cures status. Vulnerable while asleep.",
+    "sleeptalk": "ONLY useful while user is asleep — randomly picks one of user's other moves.",
+    "snore": "ONLY damages while user is asleep. Skip if awake.",
+    "trickroom": "Reverses speed order for 5 turns — slower Pokemon move first. Useful if you're slower.",
+    "tailwind": "Doubles your team's Speed for 4 turns.",
+    "protect": "Becomes less reliable with consecutive uses (chain drops to ~50% after second consecutive).",
+    "detect": "Same as Protect — chain drops on consecutive uses.",
+    "substitute": "Uses 25% of max HP to create a doll that absorbs damage until it breaks. Skip if HP < 25%.",
+    "perishsong": "All Pokemon on field faint in 3 turns unless they switch out.",
+    "encore": "Locks target into its last move for 3 turns. Useful vs predictable mons.",
+    "taunt": "Target can only use damaging moves for 3 turns. Stops setup/recovery.",
+    "fling": "BP and side effect depend on held item. Variable damage.",
+    "lastresort": "ONLY works after user has used every other move at least once.",
+    "naturepower": "Becomes a different move depending on terrain.",
+    "gigaimpact": "Must recharge next turn (cannot attack).",
+    "hyperbeam": "Must recharge next turn (cannot attack).",
+    "solarbeam": "Charges 1 turn, then attacks (skips charge in sun).",
+    "skullbash": "Charges 1 turn (boosts Def), attacks turn 2.",
+    "doubleshock": "ONLY usable by Electric-type Pokemon and removes Electric type after use.",
+    "burnup": "ONLY usable by Fire-type Pokemon and removes Fire type after use.",
+}
 
 
 class LLMAgentBase(Player):
@@ -394,6 +466,51 @@ class LLMAgentBase(Player):
             return "unknown"
 
     @staticmethod
+    def _tera_defensive_delta(active, opponent) -> str:
+        """For each of opponent's revealed moves, show how the damage multiplier
+        would change if we Tera into active.tera_type (becomes mono-tera_type
+        defensively). Returns 'flareblitz: 1x→2x WORSE; closecombat: 2x→2x same'."""
+        tera_type = getattr(active, "tera_type", None)
+        opp_moves = getattr(opponent, "moves", None) or {}
+        if not tera_type or not opp_moves:
+            return ""
+        items = []
+        t1_curr, t2_curr = (active.types + [None, None])[:2]
+        for move_id, move in opp_moves.items():
+            try:
+                before = move.type.damage_multiplier(t1_curr, t2_curr, type_chart=_TYPE_CHART)
+                after = move.type.damage_multiplier(tera_type, None, type_chart=_TYPE_CHART)
+                tag = "same" if after == before else ("WORSE" if after > before else "better")
+                items.append(f"{move_id}: {before:g}x→{after:g}x {tag}")
+            except Exception:
+                continue
+        return "; ".join(items) if items else ""
+
+    def _format_opponent_moves(self, opponent, active) -> str:
+        """List the opponent's revealed moves with their effects so the model
+        can predict incoming threats. Returns empty string if nothing revealed."""
+        moves = getattr(opponent, "moves", None) or {}
+        if not moves:
+            return ""
+        lines = ["Opponent's revealed moves so far (USE THESE to predict their next action):"]
+        for move_id, move in moves.items():
+            # Compute what this move would do TO our active (defensive view).
+            try:
+                t1, t2 = (active.types + [None, None])[:2]
+                eff = move.type.damage_multiplier(t1, t2, type_chart=_TYPE_CHART)
+                eff_note = f"vs you Eff: {eff:g}x"
+            except Exception:
+                eff_note = "vs you Eff: ?"
+            desc = self._describe_move(move) or pokeapi.get_cached_move(move_id) or ""
+            desc_note = f" | Effect: {desc}" if desc else ""
+            cat = move.category.name if getattr(move, "category", None) else "?"
+            lines.append(
+                f"  - {move_id} | MoveType: {move.type} | {cat} | BP: {move.base_power} "
+                f"| Acc: {move.accuracy} | {eff_note}{desc_note}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
     def _ability_note(pkmn) -> str:
         """Returns a short ability descriptor: '(Ability: X — description)' or
         '(Ability unknown; possible: ... )' if not yet revealed."""
@@ -411,6 +528,18 @@ class LLMAgentBase(Player):
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
 
+        tera_line = ""
+        if getattr(active, "is_terastallized", False):
+            tera_line = f"\n  Already Terastallized into: {active.tera_type}"
+        elif getattr(battle, "can_tera", False) and getattr(active, "tera_type", None):
+            tera_line = (
+                f"\n  Can Terastallize this turn: yes → would become {active.tera_type} "
+                f"(set terastallize=true in choose_move to do it)"
+            )
+            delta = self._tera_defensive_delta(active, opponent)
+            if delta:
+                tera_line += f"\n    Defensive delta vs opp's revealed moves: {delta}"
+
         active_info = (
             f"Your active Pokemon: {active.species} "
             f"(Type: {'/'.join(map(str, active.types))}) "
@@ -418,6 +547,7 @@ class LLMAgentBase(Player):
             f"Status: {active.status.name if active.status else 'None'} "
             f"Boosts: {active.boosts}\n"
             f"  {self._ability_note(active)}"
+            f"{tera_line}"
         )
 
         if opponent:
@@ -434,10 +564,12 @@ class LLMAgentBase(Player):
             # (helps the model reason about incoming threats without recalling
             # the full type chart from memory).
             your_defenses = self._defensive_profile(active, opponent.types)
+            opp_moves_block = self._format_opponent_moves(opponent, active)
             opponent_info = (
                 f"Opponent's active Pokemon: {opp_info_str}\n"
                 f"You outspeed opponent: {speed_note}\n"
                 f"Your active takes from opp's STAB types: {your_defenses}"
+                + (f"\n{opp_moves_block}" if opp_moves_block else "")
             )
         else:
             opponent_info = "Opponent's active Pokemon: Unknown"
@@ -447,15 +579,22 @@ class LLMAgentBase(Player):
             lines = []
             for move in battle.available_moves:
                 cat = move.category.name
-                desc = self._describe_move(move)
+                struct_desc = self._describe_move(move)
+                # Fall back to PokeAPI cached short_effect for moves whose
+                # mechanic isn't in poke-env's structured fields (U-turn,
+                # Stealth Rock, Leech Seed, Substitute, etc.).
+                api_desc = pokeapi.get_cached_move(move.id) or ""
+                desc = struct_desc or api_desc
                 desc_note = f" | Effect: {desc}" if desc else ""
                 if move.base_power <= 0:
                     # Status moves: lead with the loud STATUS marker so the model
                     # doesn't reason about offensive type effectiveness on them.
+                    warning = _MOVE_WARNINGS.get(move.id)
+                    warn_note = f" | ⚠ {warning}" if warning else ""
                     lines.append(
                         f"- {move.id} | STATUS (no damage, side effect only) "
                         f"| MoveType: {move.type} | Acc: {move.accuracy} "
-                        f"| PP: {move.current_pp}/{move.max_pp}{desc_note}"
+                        f"| PP: {move.current_pp}/{move.max_pp}{desc_note}{warn_note}"
                     )
                 else:
                     eff = self._move_effectiveness(move, opponent)
@@ -464,10 +603,12 @@ class LLMAgentBase(Player):
                     dmg_lead = f"Est dmg: ~{dmg:.0f}% opp HP" if dmg is not None else "Est dmg: n/a"
                     eff_lead = f"Eff: {eff:g}x" if eff is not None else "Eff: n/a"
                     stab_tag = " | STAB 1.5x" if is_stab else " | no STAB"
+                    warning = _MOVE_WARNINGS.get(move.id)
+                    warn_note = f" | ⚠ {warning}" if warning else ""
                     lines.append(
                         f"- {move.id} | {dmg_lead} | {eff_lead}{stab_tag} | MoveType: {move.type} "
                         f"| {cat} | BP: {move.base_power} | Acc: {move.accuracy} "
-                        f"| PP: {move.current_pp}/{move.max_pp}{desc_note}"
+                        f"| PP: {move.current_pp}/{move.max_pp}{desc_note}{warn_note}"
                     )
             moves_info += "\n".join(lines)
         else:
@@ -571,26 +712,37 @@ class LLMAgentBase(Player):
         return self.choose_default_move(battle)
 
     async def _prefetch_pokeapi(self, battle) -> None:
-        """Fetch ability descriptions in parallel for every visible mon.
+        """Fetch ability AND move descriptions in parallel for every visible mon.
         Skips fetching Pokemon-level data — poke-env already gives us types,
-        base stats, and possible_abilities, and the PokeAPI /pokemon endpoint
-        404s on most variant formes (sawsbuck-autumn, etc.)."""
+        base stats, and possible_abilities."""
         abilities: set = set()
+        moves: set = set()
         for p in (battle.team or {}).values():
             if p.ability:
                 abilities.add(p.ability)
             for a in (getattr(p, "possible_abilities", None) or []):
                 abilities.add(a)
+            for move_id in (p.moves or {}):
+                moves.add(move_id)
         opp = battle.opponent_active_pokemon
         if opp:
             if opp.ability:
                 abilities.add(opp.ability)
             for a in (getattr(opp, "possible_abilities", None) or []):
                 abilities.add(a)
-        # Filter out ones we already cached or already failed.
-        new = [a for a in abilities if pokeapi.get_cached_ability(a) is None]
-        if new:
-            await pokeapi.warm_team_cache([], new)
+            # Opponent's revealed moves are useful too.
+            for move_id in (opp.moves or {}):
+                moves.add(move_id)
+
+        new_abilities = [a for a in abilities if pokeapi.get_cached_ability(a) is None]
+        new_moves = [m for m in moves if pokeapi.get_cached_move(m) is None]
+        tasks = []
+        for a in new_abilities:
+            tasks.append(pokeapi.fetch_ability(a))
+        for m in new_moves:
+            tasks.append(pokeapi.fetch_move(m))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def choose_move(self, battle) -> str:
         await self._prefetch_pokeapi(battle)
@@ -638,10 +790,20 @@ class LLMAgentBase(Player):
                     chosen_move = self._find_move_by_name(battle, move_name)
                     if chosen_move and chosen_move in battle.available_moves:
                         action_taken = True
-                        print(f"AI Decision: Using move '{chosen_move.id}'.")
-                        self._record_turn(battle, f"used {chosen_move.id}", analysis, reasoning)
+                        want_tera = bool(args.get("terastallize")) if isinstance(args, dict) else False
+                        # Only honor the flag if Tera is actually available — the
+                        # model occasionally requests it when it isn't.
+                        will_tera = want_tera and getattr(battle, "can_tera", False)
+                        tera_tag = " (with TERA)" if will_tera else ""
+                        print(f"AI Decision: Using move '{chosen_move.id}'{tera_tag}.")
+                        self._record_turn(
+                            battle,
+                            f"used {chosen_move.id}{tera_tag}",
+                            analysis,
+                            reasoning,
+                        )
                         await self._send_reasoning(battle, reasoning)
-                        return self.create_order(chosen_move)
+                        return self.create_order(chosen_move, terastallize=will_tera)
                     else:
                         fallback_reason = f"LLM chose unavailable/invalid move '{move_name}'."
                 else:
@@ -828,15 +990,53 @@ class LMStudioAgent(LLMAgentBase):
             "(b) defending against incoming attacks.\n"
             "  * Example: Gyarados is Water/Flying. If it uses Earthquake (MoveType: Ground), the "
             "effectiveness vs the opponent depends on GROUND vs the opponent's types — NOT on Water/Flying. "
-            "Gyarados gets NO STAB on Earthquake because Ground is not Water or Flying.\n"
-            "  * Always check the precomputed 'Eff: Xx' and 'Est dmg: ~Y%' fields per move — they are "
-            "already correct for THIS move vs THIS opponent.\n\n"
+            "Gyarados gets NO STAB on Earthquake because Ground is not Water or Flying.\n\n"
+            "MANDATORY — USE THE PRECOMPUTED EFFECTIVENESS:\n"
+            "  * Every move line in the battle state already has 'Eff: Xx' and 'Est dmg: ~Y%' "
+            "computed for THIS exact move vs THIS exact opponent (already accounting for BOTH "
+            "of the opponent's types). USE THOSE NUMBERS DIRECTLY.\n"
+            "  * DO NOT recompute effectiveness from the type chart in your head. The chart is only "
+            "a reference if you need to reason about HYPOTHETICAL future matchups (e.g. switch decisions). "
+            "For the CURRENT opponent, the Eff field is the truth.\n"
+            "  * In your 'analysis' field, when comparing moves, you MUST cite the exact Eff and Est dmg "
+            "of each candidate move (e.g. 'Move X has Eff: 2x, Est dmg: ~55% vs Move Y at Eff: 0.5x, "
+            "Est dmg: ~10%'). NEVER write 'super effective' or 'resisted' without citing the number.\n"
+            "  * If you see Eff: 0.5x or 0.25x, that move is RESISTED — pick another option unless you "
+            "have a strong reason. Eff: 0x means IMMUNE — never pick those.\n\n"
             f"{_TYPE_CHART_TEXT}\n\n"
             "TOOL CHOICE — DO NOT MIX THEM UP:\n"
             "  * If you decide to USE A MOVE → call choose_move with a NON-EMPTY move_name from the "
             "available moves list.\n"
             "  * If you decide to SWITCH POKEMON → call choose_switch with pokemon_name from the available "
             "switches. NEVER call choose_move with an empty move_name to mean 'switch'.\n\n"
+            "TERASTALLIZATION (Gen 9):\n"
+            "  * Each Pokemon has a tera_type. Tera-ing changes your DEFENSIVE typing to tera_type "
+            "(losing your original defensive matchups) and any move matching tera_type gets STAB (1.5x). "
+            "If you tera into a type your move already matched, that STAB stacks to 2x.\n"
+            "  * Each team can Tera ONCE per battle, on any of its Pokemon, any turn.\n"
+            "  * Use Tera when: (a) a sweep opportunity exists and tera-STAB makes you OHKO/2HKO the enemy, "
+            "or (b) you're about to take a 2x super-effective hit and tera-ing into a resistant type "
+            "saves you (e.g. tera Steel to neutralize an incoming Dragon attack).\n"
+            "  * To use it: in choose_move set terastallize=true. The 'Can Terastallize this turn' line "
+            "in the active mon's info tells you if it's available and what type you'd become.\n\n"
+            "STRATEGIC HEURISTICS — apply IN ORDER OF PRIORITY:\n"
+            "  1. EMERGENCY SWITCH: If your BEST damaging move has Eff ≤ 0.5x AND any of opponent's "
+            "revealed moves has 'vs you Eff' ≥ 2x → you LOSE the trade. SWITCH to a Pokemon with better "
+            "Defenses against opp's STAB types and decent offensive coverage. Check the switches' "
+            "Defenses field — pick the one with the lowest incoming multipliers.\n"
+            "  2. HAZARDS FIRST TURN: If T1 (no battle history yet) and you have Stealth Rock, Spikes, "
+            "Toxic Spikes, or Sticky Web, USE IT. Free chip damage on every opponent switch-in is huge.\n"
+            "  3. SETUP RULE: Setup moves (Swords Dance, Nasty Plot, Calm Mind, Dragon Dance, Bulk Up, "
+            "Work Up, Iron Defense, Shell Smash, etc.) are ONLY valid when ALL these hold: "
+            "(a) HP ≥ 60%, (b) you survive opp's next hit (check opp's revealed moves' Eff vs you), "
+            "(c) you have time to abuse the boost (opponent has ≥2 mons left). "
+            "If HP < 60% or you'll faint next turn → JUST ATTACK with your best damaging move. "
+            "Setup at low HP is the most common loss-causing mistake.\n"
+            "  4. PRESERVE WINCONS: Don't sacrifice your best counter to opp's main threat unless forced.\n"
+            "  5. PRIORITY MOVES: When at low HP and outsped, priority moves (+1 like Aqua Jet, Sucker Punch) "
+            "let you get a last hit before fainting.\n"
+            "  6. DEFAULT: if none of the above apply, pick the move with highest Est dmg that's NOT resisted "
+            "(Eff > 0.5x) and has Acc ≥ 0.85.\n\n"
             "Per-turn protocol:\n"
             "  1. ANALYZE first. Fill 'analysis' with 3-5 sentences citing the EXACT numbers from the data: "
             "type matchups (cite Eff/Est dmg per move), STAB if shown, speed comparison, HP/status, threats, "
